@@ -7,6 +7,9 @@
   GET    /trips/{trip_id}             查询乘次状态
   GET    /accounts/{account_id}/days/{op_day}   查询运营日换乘组与实收
   GET    /accounts/{account_id}/ledger          游标后流水（翻页不重不漏）
+  POST   /rules                       发布按运营日生效的换乘窗口与单日封顶规则
+  GET    /rules                       规则列表与当前版本
+  GET    /rules/applicable            查询指定运营日实际适用的规则
   GET    /healthz                     健康检查
 """
 from __future__ import annotations
@@ -23,7 +26,7 @@ from fastapi.responses import JSONResponse
 from . import service
 from .db import close_pool, init_pool, init_schema
 from .errors import ApiError
-from .models import CorrectIn, TripIn
+from .models import CorrectIn, RulePublishIn, TripIn
 from .timeutil import to_beijing_iso
 
 
@@ -59,6 +62,10 @@ def _parse_validation_code(exc: RequestValidationError) -> tuple[str, str]:
         "trip_id": "INVALID_TRIP_ID",
         "account_id": "INVALID_ACCOUNT_ID",
         "expected_version": "INVALID_VERSION",
+        "effective_day": "INVALID_DATE",
+        "op_day": "INVALID_DATE",
+        "transfer_window_minutes": "INVALID_WINDOW",
+        "daily_cap_cents": "INVALID_CAP",
     }
     errs = exc.errors()
     messages, code = [], "INVALID_REQUEST"
@@ -67,7 +74,8 @@ def _parse_validation_code(exc: RequestValidationError) -> tuple[str, str]:
         messages.append(msg)
         # 自定义 validator 抛出的 "CODE: message" 优先
         for token in ("INVALID_TIME", "INVALID_FARE", "INVALID_TRIP_ID",
-                      "INVALID_ACCOUNT_ID", "INVALID_VERSION"):
+                      "INVALID_ACCOUNT_ID", "INVALID_VERSION", "INVALID_DATE",
+                      "INVALID_WINDOW", "INVALID_CAP"):
             if token in msg:
                 code = token
                 break
@@ -153,6 +161,29 @@ def get_ledger(
         "next_cursor": next_cursor,
         "entries": [e.model_dump() for e in entries],
     }
+
+
+# ------------------------------------------------------------ 规则发布
+
+@app.post("/rules", status_code=201)
+def publish_rule(body: RulePublishIn):
+    return service.publish_rule(
+        body.effective_day, body.transfer_window_minutes,
+        body.daily_cap_cents, body.expected_version).model_dump()
+
+
+@app.get("/rules")
+def list_rules():
+    current, rules = service.list_rules()
+    return {"current_version": current,
+            "rules": [r.model_dump() for r in rules]}
+
+
+@app.get("/rules/applicable")
+def applicable_rule(
+    op_day: date = Query(..., description="运营日 YYYY-MM-DD（北京日期）"),
+):
+    return service.get_applicable_rule(op_day).model_dump()
 
 
 @app.get("/healthz")

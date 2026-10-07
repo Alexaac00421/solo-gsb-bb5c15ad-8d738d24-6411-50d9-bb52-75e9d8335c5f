@@ -55,6 +55,23 @@ CREATE TABLE IF NOT EXISTS group_members (
     seq        INTEGER NOT NULL                    -- 组内顺序（按上车时刻、乘次号）
 );
 
+-- 运营规则：按运营日生效的换乘窗口（分钟）与单日封顶（分）。
+-- version 全局从 1 严格递增（与流水同理：写事务持 advisory 锁，应用层 MAX(version)+1，
+-- 回滚不烧号）；effective_day 唯一（每运营日至多一条规则）。
+-- 任一运营日适用“不晚于它的最新规则”，覆盖至下一生效日前；无记录时沿用环境变量默认配置。
+CREATE TABLE IF NOT EXISTS fare_rules (
+    version         BIGINT PRIMARY KEY,            -- 全局规则版本，从 1 开始递增
+    effective_day   DATE NOT NULL UNIQUE,          -- 生效运营日
+    transfer_window_minutes BIGINT NOT NULL,       -- 正整数：相邻两程归组最大间隔（分钟）
+    daily_cap_cents BIGINT NOT NULL,               -- 非负整数：单账户单运营日实收封顶（分）
+    published_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT window_positive CHECK (transfer_window_minutes > 0),
+    CONSTRAINT cap_non_negative CHECK (daily_cap_cents >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fare_rules_effective_day
+    ON fare_rules (effective_day);
+
 -- 流水：仅追加（append-only），seq 按提交顺序全局严格递增且无空洞。
 -- 所有写事务先取同一个事务级 advisory 锁并串行提交，应用层以 MAX(seq)+1 赋 seq。
 -- 金额类条目成对出现：day_reversal（冲销旧日实收）+ day_charge（记入新金额）。
@@ -64,7 +81,7 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
     op_day         DATE NOT NULL,
     event_type     TEXT NOT NULL CHECK (event_type IN (
                        'trip_posted', 'trip_corrected', 'trip_cancelled',
-                       'day_reversal', 'day_charge')),
+                       'day_reversal', 'day_charge', 'rule_published')),
     trip_id        TEXT,
     delta_cents    BIGINT NOT NULL,                -- 对当日实收的增量（生命周期事件为 0）
     charged_after_cents BIGINT,                    -- 金额事件后的当日实收（生命周期事件为 NULL）
@@ -75,6 +92,13 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
 CREATE INDEX IF NOT EXISTS idx_ledger_account_day_seq
     ON ledger_entries (account_id, op_day, seq);
 CREATE INDEX IF NOT EXISTS idx_ledger_trip ON ledger_entries (trip_id);
+
+-- 兼容既有部署：老库的 event_type CHECK 不含 rule_published，幂等放宽
+ALTER TABLE ledger_entries DROP CONSTRAINT IF EXISTS ledger_entries_event_type_check;
+ALTER TABLE ledger_entries ADD CONSTRAINT ledger_entries_event_type_check
+    CHECK (event_type IN (
+        'trip_posted', 'trip_corrected', 'trip_cancelled',
+        'day_reversal', 'day_charge', 'rule_published'));
 
 -- seq 不使用 SEQUENCE：事务回滚（如冲突请求）会烧掉序号产生空洞。
 -- 应用层所有写事务持有同一事务级 advisory 锁（严格串行提交），

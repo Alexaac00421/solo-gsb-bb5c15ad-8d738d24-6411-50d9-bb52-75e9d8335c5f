@@ -14,6 +14,8 @@ from .timeutil import ensure_aware, op_day_of
 
 MAX_TEXT_LEN = 128
 MIN_YEAR, MAX_YEAR = 2000, 2100
+# 换乘窗口上界（分钟）：防止 timedelta 溢出，远超任何合理业务取值
+MAX_WINDOW_MINUTES = 1_000_000_000
 
 
 def _validate_text(v: Any, field: str) -> str:
@@ -104,6 +106,50 @@ class CorrectIn(BaseModel):
         return _validate_fare(v)
 
 
+class RulePublishIn(BaseModel):
+    """发布按运营日生效的换乘窗口与单日封顶规则。"""
+    model_config = ConfigDict(extra="forbid")
+
+    effective_day: date
+    transfer_window_minutes: int
+    daily_cap_cents: int
+    expected_version: int = Field(..., ge=0,
+                                  description="当前规则版本（从未发布为 0），不符将返回冲突")
+
+    @field_validator("effective_day")
+    @classmethod
+    def _day(cls, v: date) -> date:
+        # 非法格式由 pydantic 日期解析拦截（映射为 INVALID_DATE）；此处校验年份范围
+        if not (MIN_YEAR <= v.year <= MAX_YEAR):
+            raise ValueError(
+                f"INVALID_DATE: year must be between {MIN_YEAR} and {MAX_YEAR}")
+        return v
+
+    @field_validator("transfer_window_minutes")
+    @classmethod
+    def _window(cls, v: Any) -> int:
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ValueError(
+                "INVALID_WINDOW: transfer_window_minutes must be a positive integer")
+        if v <= 0:
+            raise ValueError(
+                "INVALID_WINDOW: transfer_window_minutes must be positive")
+        if v > MAX_WINDOW_MINUTES:
+            raise ValueError(
+                f"INVALID_WINDOW: transfer_window_minutes must be <= {MAX_WINDOW_MINUTES}")
+        return v
+
+    @field_validator("daily_cap_cents")
+    @classmethod
+    def _cap(cls, v: Any) -> int:
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ValueError(
+                "INVALID_CAP: daily_cap_cents must be a non-negative integer")
+        if v < 0:
+            raise ValueError("INVALID_CAP: daily_cap_cents must be non-negative")
+        return v
+
+
 class TripView(BaseModel):
     trip_id: str
     account_id: str
@@ -141,3 +187,31 @@ class LedgerView(BaseModel):
     charged_after_cents: int | None
     reason: str
     created_at: str
+
+
+class RuleView(BaseModel):
+    version: int
+    effective_day: date
+    transfer_window_minutes: int
+    daily_cap_cents: int
+
+
+class RulePublishResult(BaseModel):
+    version: int
+    effective_day: date
+    transfer_window_minutes: int
+    daily_cap_cents: int
+    coverage_start: date                    # 覆盖区间起点（即生效日）
+    coverage_end: date | None               # 下一生效日前一天；None 表示暂无上界
+    recalculated_account_days: int          # 本次重算的账户运营日数量
+
+
+class RuleApplyView(BaseModel):
+    op_day: date
+    source: Literal["default", "rule"]      # default：无规则记录，沿用默认配置
+    version: int                            # 适用规则版本；默认配置为 0
+    effective_day: date | None
+    coverage_start: date | None
+    coverage_end: date | None
+    transfer_window_minutes: int
+    daily_cap_cents: int
