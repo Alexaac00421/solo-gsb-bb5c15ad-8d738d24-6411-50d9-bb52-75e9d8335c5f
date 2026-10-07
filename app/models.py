@@ -131,6 +131,67 @@ class DayView(BaseModel):
     charged_cents: int
 
 
+class RulePublishIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    effective_day: date
+    transfer_window_minutes: int
+    daily_cap_cents: int
+    # 该生效日当前规则版本：未发布为 0，重发须为最新版本
+    expected_version: int = Field(..., ge=0)
+
+    @field_validator("effective_day")
+    @classmethod
+    def _day(cls, v: Any) -> date:
+        if not isinstance(v, date) or isinstance(v, datetime):
+            raise ValueError("INVALID_DATE: effective_day must be a date YYYY-MM-DD")
+        if not (MIN_YEAR <= v.year <= MAX_YEAR):
+            raise ValueError(f"INVALID_DATE: year must be between {MIN_YEAR} and {MAX_YEAR}")
+        return v
+
+    @field_validator("transfer_window_minutes")
+    @classmethod
+    def _window(cls, v: Any) -> int:
+        # bool 是 int 的子类，须先排除；只接受整数
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ValueError(
+                "INVALID_WINDOW: transfer_window_minutes must be a positive integer")
+        if v <= 0:
+            raise ValueError(
+                "INVALID_WINDOW: transfer_window_minutes must be positive")
+        return v
+
+    @field_validator("daily_cap_cents")
+    @classmethod
+    def _cap(cls, v: Any) -> int:
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ValueError(
+                "INVALID_CAP: daily_cap_cents must be a non-negative integer")
+        if v < 0:
+            raise ValueError("INVALID_CAP: daily_cap_cents must be non-negative")
+        return v
+
+
+class RuleView(BaseModel):
+    """某运营日适用（或已发布）的规则。"""
+    effective_day: date | None = None          # null 表示沿用环境默认（尚无已发布规则）
+    transfer_window_minutes: int
+    daily_cap_cents: int
+    version: int = 0                           # 默认规则版本为 0
+    published: bool                            # 是否存在已发布记录
+    source: Literal["published", "default"]    # 命中发布记录 / 默认配置
+    coverage_from: date | None = None          # 覆盖区间起（生效日）
+    coverage_to: date | None = None            # 覆盖区间止（下一生效日，开区间）；null 为开放
+
+
+class RulePublishView(BaseModel):
+    idempotent: bool
+    rule: RuleView
+    coverage_from: date
+    coverage_to: date | None
+    recalculated_account_days: int             # 覆盖区间内被重算的账户运营日数
+
+
 class LedgerView(BaseModel):
     seq: int
     account_id: str

@@ -55,6 +55,19 @@ CREATE TABLE IF NOT EXISTS group_members (
     seq        INTEGER NOT NULL                    -- 组内顺序（按上车时刻、乘次号）
 );
 
+-- 运营方按运营日发布的费率规则：换乘时限（正整数分钟）与单日封顶（非负整数分）。
+-- 任一运营日采用 effective_day <= 该日 的最新一条；无记录时沿用环境默认（90/2000）。
+-- 每个生效日一行，version 从 1 起单调递增，用于乐观并发（未发布时期望版本为 0）。
+CREATE TABLE IF NOT EXISTS fare_rules (
+    effective_day           DATE PRIMARY KEY,           -- 规则生效运营日（北京日期）
+    transfer_window_minutes INTEGER NOT NULL,           -- 相邻两程同组最大间隔（分钟，含端点）
+    daily_cap_cents         BIGINT NOT NULL,            -- 单账户单运营日实收封顶（分）
+    version                 BIGINT NOT NULL DEFAULT 1,  -- 该生效日规则版本（重发 +1）
+    published_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT rule_window_positive CHECK (transfer_window_minutes > 0),
+    CONSTRAINT rule_cap_non_negative CHECK (daily_cap_cents >= 0)
+);
+
 -- 流水：仅追加（append-only），seq 按提交顺序全局严格递增且无空洞。
 -- 所有写事务先取同一个事务级 advisory 锁并串行提交，应用层以 MAX(seq)+1 赋 seq。
 -- 金额类条目成对出现：day_reversal（冲销旧日实收）+ day_charge（记入新金额）。

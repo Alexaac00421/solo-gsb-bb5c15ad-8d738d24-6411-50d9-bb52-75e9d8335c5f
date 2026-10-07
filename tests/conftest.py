@@ -35,7 +35,7 @@ def _clean_tables():
     with db.pool.connection() as conn:
         conn.execute(
             "TRUNCATE group_members, transfer_groups, day_settlements, "
-            "ledger_entries, trips RESTART IDENTITY CASCADE"
+            "ledger_entries, trips, fare_rules RESTART IDENTITY CASCADE"
         )
     yield
 

@@ -5,15 +5,17 @@
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 import psycopg
 
 from .config import settings
 from . import db
 from .errors import ApiError, conflict, not_found
-from .models import DayView, GroupView, LedgerView, TripView
+from .models import (DayView, GroupView, LedgerView, RulePublishView, RuleView,
+                     TripView)
 from .timeutil import op_day_of, to_beijing_iso
 
 # 本服务专用 advisory 锁键（随意选取的常量）
@@ -36,6 +38,158 @@ def trip_view(row: TripRow) -> TripView:
     )
 
 
+# ---------------------------------------------------------------- 费率规则
+
+@contextmanager
+def _read_tx() -> Iterator[psycopg.Connection]:
+    """读事务：REPEATABLE READ 快照。
+
+    写事务均持同一 advisory 锁串行提交；读侧取一致快照即可保证规则发布
+    （改规则 + 重算账单 + 追加流水）过程中，查询永远看不到规则与账单不一致
+    的中间态。
+    """
+    with db.pool.connection() as conn:
+        with conn.transaction():
+            conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            yield conn
+
+
+def _rule_row_for(conn: psycopg.Connection, op_day: date) -> TripRow | None:
+    """不晚于 op_day 的最新一条已发布规则（无则 None，调用方沿用默认配置）。"""
+    return conn.execute(
+        """SELECT * FROM fare_rules
+           WHERE effective_day <= %s
+           ORDER BY effective_day DESC LIMIT 1""",
+        (op_day,),
+    ).fetchone()
+
+
+def _next_rule_day(conn: psycopg.Connection, effective_day: date) -> date | None:
+    row = conn.execute(
+        """SELECT MIN(effective_day) AS d FROM fare_rules
+           WHERE effective_day > %s""",
+        (effective_day,),
+    ).fetchone()
+    return row["d"] if row and row["d"] is not None else None
+
+
+def _rule_view(conn: psycopg.Connection, rule: TripRow | None) -> RuleView:
+    if rule is None:
+        return RuleView(
+            effective_day=None,
+            transfer_window_minutes=settings.transfer_window_minutes,
+            daily_cap_cents=settings.daily_cap_cents,
+            version=0, published=False, source="default")
+    coverage_to = _next_rule_day(conn, rule["effective_day"])
+    return RuleView(
+        effective_day=rule["effective_day"],
+        transfer_window_minutes=rule["transfer_window_minutes"],
+        daily_cap_cents=rule["daily_cap_cents"],
+        version=rule["version"], published=True, source="published",
+        coverage_from=rule["effective_day"], coverage_to=coverage_to)
+
+
+def get_rule(op_day: date) -> RuleView:
+    """查询指定运营日适用规则（含覆盖区间）。"""
+    with _read_tx() as conn:
+        rule = _rule_row_for(conn, op_day)
+        view = _rule_view(conn, rule)
+        if rule is None:
+            # 默认规则覆盖 (-∞, 首条生效日)；针对查询日给出其所在默认区间
+            first = conn.execute(
+                "SELECT MIN(effective_day) AS d FROM fare_rules"
+            ).fetchone()
+            view.coverage_to = first["d"] if first and first["d"] is not None else None
+    return view
+
+
+def list_rules() -> list[RuleView]:
+    """列出全部已发布规则（按生效日升序）。"""
+    with _read_tx() as conn:
+        rows = conn.execute(
+            "SELECT * FROM fare_rules ORDER BY effective_day ASC"
+        ).fetchall()
+        return [_rule_view(conn, r) for r in rows]
+
+
+def publish_rule(effective_day: date, window_minutes: int, cap_cents: int,
+                 expected_version: int) -> tuple[RulePublishView, bool]:
+    """发布（或重发）某运营日生效的规则。返回 (响应, 是否幂等重放)。
+
+    与乘次提交/更正/撤销共用同一事务级 advisory 锁，故规则重算与账单写入
+    严格串行；同一事务内重算覆盖区间内已有乘次的账户运营日。
+    """
+    with db.pool.connection() as conn:
+        with conn.transaction():
+            conn.execute("SELECT pg_advisory_xact_lock(%s)", (ADVISORY_KEY,))
+            existing = conn.execute(
+                "SELECT * FROM fare_rules WHERE effective_day = %s FOR UPDATE",
+                (effective_day,),
+            ).fetchone()
+
+            if existing is None and expected_version != 0:
+                raise conflict(
+                    "RULE_VERSION_CONFLICT",
+                    f"no rule published on {effective_day.isoformat()}; "
+                    f"expected version 0, got {expected_version}")
+            if existing is not None and existing["version"] != expected_version:
+                raise conflict(
+                    "RULE_VERSION_CONFLICT",
+                    f"rule {effective_day.isoformat()} expected version "
+                    f"{existing['version']}, got {expected_version}")
+
+            if (existing is not None
+                    and existing["transfer_window_minutes"] == window_minutes
+                    and existing["daily_cap_cents"] == cap_cents):
+                # 同内容同版本重发：幂等，不改数据、不重算、不产生流水
+                view = _rule_view(conn, existing)
+                return (RulePublishView(
+                            idempotent=True, rule=view,
+                            coverage_from=effective_day,
+                            coverage_to=view.coverage_to,
+                            recalculated_account_days=0),
+                        True)
+
+            rule = conn.execute(
+                """INSERT INTO fare_rules
+                       (effective_day, transfer_window_minutes,
+                        daily_cap_cents, version, published_at)
+                   VALUES (%s, %s, %s, %s, now())
+                   ON CONFLICT (effective_day) DO UPDATE
+                   SET transfer_window_minutes = EXCLUDED.transfer_window_minutes,
+                       daily_cap_cents = EXCLUDED.daily_cap_cents,
+                       version = fare_rules.version + 1,
+                       published_at = now()
+                   RETURNING *""",
+                (effective_day, window_minutes, cap_cents,
+                 expected_version + 1),
+            ).fetchone()
+            coverage_to = _next_rule_day(conn, rule["effective_day"])
+
+            # 覆盖区间 [effective_day, coverage_to) 内已有乘次的
+            # 账户运营日全部重算（排序仅为流水序号确定，无业务含义）。
+            affected_rows = conn.execute(
+                """SELECT DISTINCT account_id, op_day FROM trips
+                   WHERE status = 'active'
+                     AND op_day >= %s
+                     AND (CAST(%s AS date) IS NULL OR op_day < %s)
+                   ORDER BY account_id, op_day""",
+                (effective_day, coverage_to, coverage_to),
+            ).fetchall()
+            for r in affected_rows:
+                _recalc_day(
+                    conn, r["account_id"], r["op_day"],
+                    reason=f"rule_published:{effective_day.isoformat()}",
+                    trip_id=None)
+            view = _rule_view(conn, rule)
+            return (RulePublishView(
+                        idempotent=False, rule=view,
+                        coverage_from=effective_day,
+                        coverage_to=coverage_to,
+                        recalculated_account_days=len(affected_rows)),
+                    False)
+
+
 # ---------------------------------------------------------------- 读操作
 
 def get_trip(trip_id: str) -> TripRow:
@@ -49,7 +203,12 @@ def get_trip(trip_id: str) -> TripRow:
 
 
 def get_day(account_id: str, op_day: date) -> DayView:
-    with db.pool.connection() as conn:
+    with _read_tx() as conn:
+        # 适用规则与账单取同一快照，保证发布事务提交前/后的视图各自一致
+        rule = _rule_row_for(conn, op_day)
+        daily_cap = (rule["daily_cap_cents"] if rule is not None
+                     else settings.daily_cap_cents)
+
         groups_raw = conn.execute(
             """SELECT group_id, group_index, group_fare_cents,
                       first_boarding_at, last_boarding_at
@@ -91,7 +250,7 @@ def get_day(account_id: str, op_day: date) -> DayView:
         op_day=op_day,
         groups=groups,
         sum_group_fare_cents=sum_fare,
-        daily_cap_cents=settings.daily_cap_cents,
+        daily_cap_cents=daily_cap,
         charged_cents=charged,
     )
 
@@ -159,12 +318,12 @@ def _append_ledger(
     )
 
 
-def _build_groups(trips: Iterable[TripRow]) -> list[list[TripRow]]:
+def _build_groups(trips: Iterable[TripRow], window_minutes: int) -> list[list[TripRow]]:
     """按 (上车时刻, 乘次号) 排序后贪心归组：相邻间隔 <= 窗口分钟即同组。
 
-    trips 已由 SQL 按 (boarding_at, trip_id) 排序。
+    trips 已由 SQL 按 (boarding_at, trip_id) 排序；窗口取该运营日适用规则。
     """
-    window = timedelta(minutes=settings.transfer_window_minutes)
+    window = timedelta(minutes=window_minutes)
     groups: list[list[TripRow]] = []
     prev_time: datetime | None = None
     for t in trips:
@@ -180,8 +339,15 @@ def _recalc_day(conn: psycopg.Connection, account_id: str, op_day: date,
                 reason: str, trip_id: str | None) -> int:
     """重算单个账户单个运营日：重写换乘组/日结，实收变化时追加冲销+新收流水。
 
+    换乘时限与封顶值取该运营日适用的已发布规则（无记录时沿用环境默认）。
     返回重算后的实收金额。
     """
+    rule = _rule_row_for(conn, op_day)
+    window_minutes = (rule["transfer_window_minutes"] if rule is not None
+                      else settings.transfer_window_minutes)
+    daily_cap = (rule["daily_cap_cents"] if rule is not None
+                 else settings.daily_cap_cents)
+
     trips = conn.execute(
         """SELECT * FROM trips
            WHERE account_id = %s AND op_day = %s AND status = 'active'
@@ -220,7 +386,7 @@ def _recalc_day(conn: psycopg.Connection, account_id: str, op_day: date,
 
     sum_group_fare = 0
     if trips:
-        for idx, members in enumerate(_build_groups(trips)):
+        for idx, members in enumerate(_build_groups(trips, window_minutes)):
             fares = [m["base_fare_cents"] for m in members]
             group_fare = max(fares)
             sum_group_fare += group_fare
@@ -239,7 +405,7 @@ def _recalc_day(conn: psycopg.Connection, account_id: str, op_day: date,
                     [(row["group_id"], m["trip_id"], seq) for seq, m in enumerate(members)],
                 )
 
-    new_charged = min(sum_group_fare, settings.daily_cap_cents)
+    new_charged = min(sum_group_fare, daily_cap)
 
     # 日结 upsert（当日无有效乘次则删除日结）
     if not trips:

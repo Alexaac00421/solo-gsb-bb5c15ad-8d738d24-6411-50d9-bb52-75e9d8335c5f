@@ -7,6 +7,9 @@
   GET    /trips/{trip_id}             查询乘次状态
   GET    /accounts/{account_id}/days/{op_day}   查询运营日换乘组与实收
   GET    /accounts/{account_id}/ledger          游标后流水（翻页不重不漏）
+  POST   /rules                       发布按运营日生效的换乘时限/封顶规则
+  GET    /rules/{op_day}              查询指定运营日适用规则
+  GET    /rules                       列出全部已发布规则
   GET    /healthz                     健康检查
 """
 from __future__ import annotations
@@ -23,7 +26,7 @@ from fastapi.responses import JSONResponse
 from . import service
 from .db import close_pool, init_pool, init_schema
 from .errors import ApiError
-from .models import CorrectIn, TripIn
+from .models import CorrectIn, RulePublishIn, TripIn
 from .timeutil import to_beijing_iso
 
 
@@ -59,6 +62,10 @@ def _parse_validation_code(exc: RequestValidationError) -> tuple[str, str]:
         "trip_id": "INVALID_TRIP_ID",
         "account_id": "INVALID_ACCOUNT_ID",
         "expected_version": "INVALID_VERSION",
+        "effective_day": "INVALID_DATE",
+        "op_day": "INVALID_DATE",
+        "transfer_window_minutes": "INVALID_WINDOW",
+        "daily_cap_cents": "INVALID_CAP",
     }
     errs = exc.errors()
     messages, code = [], "INVALID_REQUEST"
@@ -67,7 +74,8 @@ def _parse_validation_code(exc: RequestValidationError) -> tuple[str, str]:
         messages.append(msg)
         # 自定义 validator 抛出的 "CODE: message" 优先
         for token in ("INVALID_TIME", "INVALID_FARE", "INVALID_TRIP_ID",
-                      "INVALID_ACCOUNT_ID", "INVALID_VERSION"):
+                      "INVALID_ACCOUNT_ID", "INVALID_VERSION", "INVALID_DATE",
+                      "INVALID_WINDOW", "INVALID_CAP"):
             if token in msg:
                 code = token
                 break
@@ -136,6 +144,29 @@ def get_trip(trip_id: str):
 @app.get("/accounts/{account_id}/days/{op_day}")
 def get_day(account_id: str, op_day: date):
     return service.get_day(account_id, op_day).model_dump()
+
+
+# ------------------------------------------------------------ 费率规则
+
+@app.post("/rules")
+def publish_rule(body: RulePublishIn):
+    """发布按运营日生效的换乘时限/单日封顶规则；同内容同版本重发幂等。"""
+    out, _ = service.publish_rule(
+        body.effective_day, body.transfer_window_minutes,
+        body.daily_cap_cents, body.expected_version)
+    return out.model_dump()
+
+
+@app.get("/rules/{op_day}")
+def get_rule(op_day: date):
+    """查询指定运营日适用规则（命中发布记录或沿用默认，含覆盖区间）。"""
+    return service.get_rule(op_day).model_dump()
+
+
+@app.get("/rules")
+def list_rules():
+    """列出全部已发布规则（按生效日升序）。"""
+    return {"rules": [r.model_dump() for r in service.list_rules()]}
 
 
 @app.get("/accounts/{account_id}/ledger")
